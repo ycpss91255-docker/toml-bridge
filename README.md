@@ -26,10 +26,35 @@ publish workflow moves `:latest` on every finished (non-prerelease)
 `vX.Y.Z` tag, which is precisely the thing a consumer does not want
 moving under it.
 
-The image is multi-architecture: `linux/amd64` and `linux/arm64`, each
-built on a native runner. `:main` also exists as the rolling build of
-this branch; it is fine for trying the image out and is not something
-to depend on.
+The image is multi-architecture, `linux/amd64` and `linux/arm64`, each
+built on a native runner.
+
+> **This repo cannot publish yet, and no `v*` tag exists.** The package
+> `ghcr.io/ycpss91255-docker/toml-bridge` already exists and is public,
+> but it was created by — and its Actions write access is still linked
+> to — `ycpss91255-docker/base`, which publishes to the same name from
+> its own `release-toml-bridge.yaml`. A push from this repo is refused
+> with `denied: permission_denied: write_package` even though the job
+> holds `packages: write`.
+>
+> Two things have to happen, in either order, and both are outside this
+> repo: grant this repository write access to the package (its
+> *Package settings → Manage Actions access*), and retire
+> `release-toml-bridge.yaml` in `base` so the name has one publisher
+> rather than two racing on the same tags. Then tag `v0.1.0` here.
+>
+> Until then the only pullable tag is `:main`, built by `base`:
+>
+> ```sh
+> docker pull ghcr.io/ycpss91255-docker/toml-bridge:main
+> ```
+>
+> It is byte-for-byte the same recipe as this repo's `Dockerfile`, and
+> it is a rolling tag — fine for trying the image out, not something to
+> depend on.
+
+Throughout the rest of this document `<image>` stands for whichever of
+those references you pinned.
 
 ## The CLI contract
 
@@ -46,7 +71,7 @@ anything you want to run *instead* of the parser needs
 ### 1. Default — TOML on stdin, JSON on stdout
 
 ```console
-$ printf '[gui]\nmode = "wayland"\n' | docker run --rm -i ghcr.io/ycpss91255-docker/toml-bridge:v0.1.0
+$ printf '[gui]\nmode = "wayland"\n' | docker run --rm -i <image>
 {"gui": {"mode": "wayland"}}
 ```
 
@@ -306,10 +331,20 @@ image by digest, and a merge job assembles the multi-arch manifest.
 | push to `main` | `:main` |
 | `workflow_dispatch` | resolved from the ref it was dispatched from; any ref that is neither `main` nor a `v*` tag is refused |
 
+A tag push does fire this workflow despite the `paths:` filter sitting
+alongside `tags:` — GitHub does not apply path filtering to a newly
+pushed tag. That is observed behaviour in `base`, whose identically
+shaped `release-test-tools.yaml` has published on `v0.42.0`,
+`v0.43.0-rc1` and others, not something inferred from the docs.
+
 `script/ci/release-ref.sh` is the single classifier of "is this tag a
 prerelease" — a copy of the script of the same name in `base`, which
 refuses a ref it cannot read as a semver tag rather than guessing
 `false`, since `false` is the branch that moves `:latest`.
+
+None of this can run until the package-ownership conflict described
+under *Pull* is resolved. The first push to `main` did trigger the
+workflow, built both architectures, and was refused at the registry.
 
 ## Licence
 
