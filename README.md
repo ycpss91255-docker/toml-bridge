@@ -29,32 +29,17 @@ moving under it.
 The image is multi-architecture, `linux/amd64` and `linux/arm64`, each
 built on a native runner.
 
-> **This repo cannot publish yet, and no `v*` tag exists.** The package
-> `ghcr.io/ycpss91255-docker/toml-bridge` already exists and is public,
-> but it was created by — and its Actions write access is still linked
-> to — `ycpss91255-docker/base`, which publishes to the same name from
-> its own `release-toml-bridge.yaml`. A push from this repo is refused
-> with `denied: permission_denied: write_package` even though the job
-> holds `packages: write`.
->
-> Two things have to happen, in either order, and both are outside this
-> repo: grant this repository write access to the package (its
-> *Package settings → Manage Actions access*), and retire
-> `release-toml-bridge.yaml` in `base` so the name has one publisher
-> rather than two racing on the same tags. Then tag `v0.1.0` here.
->
-> Until then the only pullable tag is `:main`, built by `base`:
->
-> ```sh
-> docker pull ghcr.io/ycpss91255-docker/toml-bridge:main
-> ```
->
-> It is byte-for-byte the same recipe as this repo's `Dockerfile`, and
-> it is a rolling tag — fine for trying the image out, not something to
-> depend on.
+`:main` also exists, as the rolling build of this branch. It is fine for
+trying the image out and is not something to depend on.
 
-Throughout the rest of this document `<image>` stands for whichever of
-those references you pinned.
+> **`ycpss91255-docker/base` still publishes to this same package** from
+> its own `release-toml-bridge.yaml`, carrying the recipe this repo was
+> extracted from. Until that workflow is retired, two repositories can
+> write the same tags, and `:main` is whichever of them ran last. The
+> `vX.Y.Z` tags are only ever pushed from here.
+
+Throughout the rest of this document `<image>` stands for whichever
+reference you pinned.
 
 ## The CLI contract
 
@@ -275,7 +260,7 @@ of these staying as they are.**
 
 There is no shell library in this repo, deliberately: the invocation is
 two `docker run` lines, and the consumer owns where the image reference
-comes from. The shape both current consumers use:
+comes from. The shape `base` uses:
 
 ```bash
 # Parse one file. JSON on stdout; add --kv for tab-separated lines.
@@ -299,12 +284,38 @@ toml_merge() {
 
 Check the exit status. Point 7 above is what happens if you do not.
 
+## Two supported usages
+
+**As an application** — run the baked-in CLI, exactly as documented
+above. This is what `base` does.
+
+**As a runtime** — override the entrypoint and run your own program
+inside the image, treating it as "a pinned Python with TOML parsing
+available":
+
+```sh
+docker run --rm -i --entrypoint python3 \
+  -v "$PWD/reader.py:/reader.py:ro" <image> /reader.py
+```
+
+Both are supported and neither is a workaround. The reason the second
+exists is that the baked-in CLI carries `base`'s semantics: the
+`--kv` array table (point 9 above) is `base`'s compose vocabulary, so a
+consumer whose TOML has an array of tables that is not on that list
+gets no output for it and exit 0 — a silent nothing, not an error.
+
+`ycpss91255-research/vendor_kit` uses the image the second way, for
+that reason. Nothing in the image or in `toml_bridge.py` is shaped to
+accommodate it; the image is a pinned Python 3.13 with `tomllib` in the
+stdlib and `tomli` installed, and that is the whole of what a runtime
+consumer depends on.
+
 ## Consumers
 
-| Repo | What it reads |
+| Repo | How it uses the image |
 |---|---|
-| [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base) | its own configuration — `dist/script/docker/lib/toml_bridge.sh` shims the image, `conf.sh` tokenises `--kv` output. `base` also lifts the parser into its `test-tools` image with `COPY --from`, so repos downstream of `base` inherit it without pulling this image directly. |
-| [`ycpss91255-research/vendor_kit`](https://github.com/ycpss91255-research/vendor_kit) | a consumer repo's manifest — the file that says which parts of a vendored tree get installed. |
+| [`ycpss91255-docker/base`](https://github.com/ycpss91255-docker/base) | **application.** Reads its own configuration — `dist/script/docker/lib/toml_bridge.sh` shims the image, `conf.sh` tokenises `--kv` output. `base` also lifts the parser into its `test-tools` image with `COPY --from`, so repos downstream of `base` inherit it without pulling this image directly. |
+| [`ycpss91255-research/vendor_kit`](https://github.com/ycpss91255-research/vendor_kit) | **runtime.** Reads a consumer repo's manifest — the file that says which parts of a vendored tree get installed — with its own reader run inside the image, since the manifest's arrays are not `base`'s. |
 
 ## Building and testing locally
 
@@ -342,9 +353,8 @@ prerelease" — a copy of the script of the same name in `base`, which
 refuses a ref it cannot read as a semver tag rather than guessing
 `false`, since `false` is the branch that moves `:latest`.
 
-None of this can run until the package-ownership conflict described
-under *Pull* is resolved. The first push to `main` did trigger the
-workflow, built both architectures, and was refused at the registry.
+The workflow creates no GitHub Release; it publishes image tags only. A
+release, if one is wanted for a version, is cut by hand.
 
 ## Licence
 
