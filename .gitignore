@@ -1,0 +1,4 @@
+# The parser is a single script that the image COPYs in; running it
+# directly, or importing it from a test, leaves bytecode behind.
+__pycache__/
+*.py[cod]

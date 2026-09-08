@@ -1,0 +1,260 @@
+name: Release toml-bridge image to GHCR
+
+# Single-purpose publisher for the containerised TOML parser. Pushes a
+# multi-arch (linux/amd64 + linux/arm64) image to
+# ghcr.io/ycpss91255-docker/toml-bridge.
+#
+# Consumers -- ycpss91255-docker/base reading its own configuration,
+# ycpss91255-research/vendor_kit reading a consumer's manifest, and any
+# repo whose compose recipe needs TOML parsing -- pull this image rather
+# than building it locally, the same pattern release-test-tools.yaml
+# established for test-tools.
+#
+# Triggers:
+#   push of a vX.Y.Z tag -> pushes :<tag>, plus :latest when the tag is
+#                           NOT a prerelease (script/ci/release-ref.sh
+#                           owns the classification, same as base's
+#                           release-test-tools.yaml).
+#   push to main (Dockerfile, toml_bridge.py, or this workflow changed)
+#                        -> pushes :main rolling tag.
+#   workflow_dispatch    -> resolves by the ref it was dispatched FROM:
+#                           main takes the :main arm, a v* tag takes the
+#                           tag arm. Any other ref is refused.
+#
+# Multi-arch build model: mirrors release-test-tools.yaml. Each
+# architecture builds on its NATIVE runner (no QEMU), pushes a
+# single-arch image by digest, then the merge job assembles a tagged
+# multi-arch manifest list via `docker buildx imagetools create`.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'toml_bridge.py'
+      - '.github/workflows/release-toml-bridge.yaml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: release-toml-bridge-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/ycpss91255-docker/toml-bridge
+
+jobs:
+  compute-matrix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        env:
+          PLATFORMS: "linux/amd64,linux/arm64"
+        run: |
+          set -euo pipefail
+          items=""
+          IFS=',' read -ra plats <<< "${PLATFORMS}"
+          for p in "${plats[@]}"; do
+            p="${p//[[:space:]]/}"
+            case "${p}" in
+              linux/amd64)
+                items+='{"platform":"linux/amd64","runner":"ubuntu-latest","hardware":"amd64"},'
+                ;;
+              linux/arm64)
+                items+='{"platform":"linux/arm64","runner":"ubuntu-24.04-arm","hardware":"arm64"},'
+                ;;
+              "")
+                continue
+                ;;
+              *)
+                echo "::error::Unsupported platform '${p}'. Supported: linux/amd64, linux/arm64"
+                exit 1
+                ;;
+            esac
+          done
+          if [ -z "${items}" ]; then
+            echo "::error::No valid platforms found in '${PLATFORMS}'"
+            exit 1
+          fi
+          echo "matrix={\"include\":[${items%,}]}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: compute-matrix
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.compute-matrix.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    # The toml-bridge image is a Python alpine base plus a pip install
+    # and a COPY -- no native compilation, no kcov. Well under a minute
+    # on hosted runners; the timeout is generous for queue time.
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest (${{ matrix.platform }})
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.hardware }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF##refs/tags/}"
+            tags="${IMAGE}:${ver}"
+            pre="$(./script/ci/release-ref.sh prerelease "${ver}")"
+            if [[ "${pre}" == 'true' ]]; then
+              echo "::notice::${ver} is a prerelease tag: publishing" \
+                "${IMAGE}:${ver} only and leaving :latest where it is."
+            else
+              tags="${tags},${IMAGE}:latest"
+            fi
+            smoke="${IMAGE}:${ver}"
+          elif [[ "${GITHUB_REF}" == refs/heads/main ]]; then
+            tags="${IMAGE}:main"
+            smoke="${IMAGE}:main"
+          else
+            echo "::error::${GITHUB_REF} is neither a v* tag nor main," \
+              "so this workflow has no tag to publish for it. Dispatch" \
+              "from main, or push a v* tag." >&2
+            exit 1
+          fi
+          printf 'tags=%s\n' "${tags}" >> "${GITHUB_OUTPUT}"
+          printf 'smoke=%s\n' "${smoke}" >> "${GITHUB_OUTPUT}"
+          echo "Computed tags: ${tags}"
+
+      - name: Create multi-arch manifest
+        working-directory: /tmp/digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_args=()
+          IFS=',' read -ra _tags <<< "${{ steps.tags.outputs.tags }}"
+          for _t in "${_tags[@]}"; do
+            tag_args+=("-t" "${_t}")
+          done
+          src=()
+          for _d in *; do
+            src+=("${IMAGE}@sha256:${_d}")
+          done
+          docker buildx imagetools create "${tag_args[@]}" "${src[@]}"
+
+      - name: Smoke test pushed image
+        shell: bash
+        # Pull the just-pushed image and verify the four things consumers
+        # rely on: Python runs, tomllib is importable (stdlib 3.11+),
+        # tomli is present as the documented fallback, and the entrypoint
+        # parses a TOML document to JSON.
+        #
+        # The image sets ENTRYPOINT ["python3", "/usr/local/bin/toml-bridge"],
+        # so every check that wants a plain interpreter must override it
+        # with --entrypoint. Without that override the arguments are fed
+        # to the bridge instead, which ignores them, reads empty stdin and
+        # exits 0 -- an assertion that can no longer fail.
+        run: |
+          set -euo pipefail
+          image="${{ steps.tags.outputs.smoke }}"
+          docker pull "${image}"
+
+          # Python version: 3.11+ is required for stdlib tomllib.
+          py_ver="$(docker run --rm --entrypoint python3 "${image}" --version)"
+          echo "Python version: ${py_ver}"
+          case "${py_ver}" in
+            'Python 3.1'[1-9]*|'Python 3.'[2-9][0-9]*|'Python '[4-9]*) ;;
+            *)
+              echo "::error::${image} reports '${py_ver}'; stdlib tomllib needs Python 3.11+" >&2
+              exit 1
+              ;;
+          esac
+
+          # tomllib import: the acceptance criterion.
+          docker run --rm --entrypoint python3 "${image}" \
+            -c "import tomllib; print('tomllib OK')"
+
+          # tomli fallback: vendored via pip for older runtimes.
+          docker run --rm --entrypoint python3 "${image}" \
+            -c "import tomli; print('tomli OK')"
+
+          # End-to-end: pipe TOML through the entrypoint, verify JSON.
+          result="$(printf '[gui]\nmode = "wayland"\n' | docker run --rm -i "${image}")"
+          if ! python3 -c "import json, sys; d=json.loads(sys.argv[1]); assert d['gui']['mode']=='wayland'" "${result}" 2>/dev/null; then
+            echo "toml-bridge entrypoint did not produce expected JSON: ${result}" >&2
+            exit 1
+          fi
+          echo "toml-bridge entrypoint: OK (${result})"
+
+          # End-to-end: the --kv arm consumers tokenise with `read -r`.
+          kv="$(printf '[gui]\nmode = "wayland"\n' | docker run --rm -i "${image}" --kv)"
+          if [[ "${kv}" != "$(printf 'gui\tmode\twayland')" ]]; then
+            echo "toml-bridge --kv did not produce the expected TSV: ${kv}" >&2
+            exit 1
+          fi
+          echo "toml-bridge --kv: OK"
