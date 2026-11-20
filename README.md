@@ -51,7 +51,7 @@ ENTRYPOINT ["python3", "/usr/local/bin/toml-bridge"]
 
 so arguments passed after the image name are the parser's arguments, and
 anything you want to run *instead* of the parser needs
-`--entrypoint`. There are three modes.
+`--entrypoint`. There are three general modes and four listing modes.
 
 ### 1. Default — TOML on stdin, JSON on stdout
 
@@ -148,6 +148,24 @@ y = 9
 $ docker run --rm -v "$PWD:$PWD:ro" <image> --merge "$PWD/base.toml" "$PWD/local.toml"
 {"a": {"x": 1, "y": 9}}
 ```
+
+### Listing modes: `--tables`, `--empty-families`, `--empty-arrays`, `--entries`
+
+Four modes read one TOML document from stdin and print lines for
+`ycpss91255-docker/base` (toml-bridge#4):
+
+- `--tables` prints the dotted path of every declared table, plus each
+  root-level array by name.
+- `--empty-families` prints `<section><TAB><prefix>_1<TAB><path>` for each
+  empty array of a known family (`rules`, `args`, `ports`, ...).
+- `--empty-arrays` prints `<section><TAB><path>` for every empty array,
+  `<section>` being the path's first component.
+- `--entries` prints `<section><TAB><n><TAB><header><TAB><field><TAB><value>`,
+  one row per field. An array no numbered family carries is refused with
+  exit 1 and empty stdout. It does not combine with `--merge`.
+
+Their expected output is pinned in `script/ci/test_base_modes.py`; run it
+with `python3 -m unittest discover -s script/ci -p 'test_*.py'`.
 
 ### Exit codes
 
